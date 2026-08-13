@@ -1,13 +1,16 @@
 import streamlit as st
+import streamlit.components.v1 as components
 import pandas as pd
-from fpdf import FPDF
+import io
+import zipfile
+import xml.etree.ElementTree as ET
 
-st.set_page_config(page_title="智能出貨單據轉換工具", page_icon="📦", layout="centered")
+st.set_page_config(page_title="智能出貨單據與物流轉換工具", page_icon="📦", layout="centered")
 
 st.title("📦 智能出貨單據與物流轉換工具")
-st.markdown("請先在下方**填寫物流參數**並**上傳內部銷貨單 Excel**，即可一鍵生成 PDF！")
+st.markdown("請在下方填寫物流參數並上傳內部銷貨單 Excel，系統將自動轉換並提供精美預覽與一鍵列印！")
 
-# 1. 讓使用者「一開始」就能直接填寫物流參數
+# 1. 頂部物流參數輸入區
 st.subheader("⚙️ 1. 輸入出貨物流參數")
 col1, col2 = st.columns(2)
 with col1:
@@ -23,80 +26,187 @@ st.markdown("---")
 st.subheader("📁 2. 上傳內部銷貨單 Excel")
 uploaded_file = st.file_uploader("請上傳銷貨單檔案 (.xlsx)", type=["xlsx", "xls"])
 
-# 3. 生成 PDF 按鈕（只要有上傳檔案就能按）
+items_data = []
+header_data = {}
+
 if uploaded_file is not None:
-    if st.button("🚀 立即生成 Invoice & Packing List PDF"):
+    try:
+        file_bytes = uploaded_file.read()
+        fixed_io = io.BytesIO()
+        
+        # 自動修復 openpyxl 常見的 NamedCellStyle 錯誤
         try:
-            # 讀取 ERP 銷貨單結構 (對應 單頭資料 與 單身資料)
-            df_head = pd.read_excel(uploaded_file, sheet_name='單頭資料', header=2)
-            df_body = pd.read_excel(uploaded_file, sheet_name='單身資料', header=2)
-            
-            header_data = df_head.iloc[0]
-            items = df_body[['品號', '品名', '規格', '數量', '單價', '金額']].dropna(subset=['品號'])
-            
-            # 使用 FPDF 輕量生成 PDF
-            class PDF(FPDF):
-                def header(self):
-                    self.set_font("helvetica", "B", 16)
-                    self.cell(0, 10, "INVOICE & PACKING LIST", align="C", new_x="LMARGIN", new_y="NEXT")
-                    self.ln(5)
+            with zipfile.ZipFile(io.BytesIO(file_bytes), 'r') as zin:
+                with zipfile.ZipFile(fixed_io, 'w') as zout:
+                    for item in zin.infolist():
+                        buffer = zin.read(item.filename)
+                        if item.filename == 'xl/styles.xml':
+                            root = ET.fromstring(buffer)
+                            for elem in root.iter():
+                                if elem.tag.endswith('cellStyle') and ('name' not in elem.attrib or not elem.attrib['name']):
+                                    elem.attrib['name'] = 'Normal'
+                            buffer = ET.tostring(root)
+                        zout.writestr(item, buffer)
+            fixed_io.seek(0)
+            excel_to_read = fixed_io
+        except Exception:
+            excel_to_read = io.BytesIO(file_bytes)
 
-                def footer(self):
-                    self.set_y(-15)
-                    self.set_font("helvetica", "I", 8)
-                    self.cell(0, 10, f"Page {self.page_no()}", align="C")
-
-            pdf = PDF()
-            pdf.add_page()
+        # 讀取 ERP 銷貨單結構
+        df_head = pd.read_excel(excel_to_read, sheet_name='單頭資料', header=2)
+        df_body = pd.read_excel(excel_to_read, sheet_name='單身資料', header=2)
+        
+        header_data = df_head.iloc[0]
+        items_df = df_body[['品號', '品名', '規格', '數量', '單價', '金額']].dropna(subset=['品號'])
+        
+        for _, row in items_df.iterrows():
+            item_name = str(row.get('品名', '')).strip()
+            spec = str(row.get('規格', '')).strip()
+            full_desc = f"{item_name} {spec}".strip() if spec and spec != 'nan' else item_name
+            items_data.append({
+                "品號": str(row.get('品號', '')),
+                "品名與規格": full_desc,
+                "數量": int(row.get('數量', 0)),
+                "單價": float(row.get('單價', 0)),
+                "金額": float(row.get('金額', 0))
+            })
             
-            # 基本資訊
-            pdf.set_font("helvetica", "", 10)
-            pdf.cell(0, 6, f"Invoice No: {header_data.get('銷貨單號', '')}", new_x="LMARGIN", new_y="NEXT")
-            pdf.cell(0, 6, f"Date: {doc_date}", new_x="LMARGIN", new_y="NEXT")
-            pdf.cell(0, 6, f"Ship to: {str(header_data.get('客戶全名', ''))}", new_x="LMARGIN", new_y="NEXT")
-            pdf.cell(0, 6, f"Address: {str(header_data.get('送貨地址(一)', ''))}", new_x="LMARGIN", new_y="NEXT")
-            pdf.ln(5)
-            
-            # 表格標題
-            pdf.set_font("helvetica", "B", 10)
-            pdf.cell(35, 8, "Item", border=1, align="C")
-            pdf.cell(85, 8, "Description", border=1, align="C")
-            pdf.cell(20, 8, "Qty", border=1, align="C")
-            pdf.cell(25, 8, "Price", border=1, align="C")
-            pdf.cell(25, 8, "Amount", border=1, align="C", new_x="LMARGIN", new_y="NEXT")
-            
-            # 表格內容
-            pdf.set_font("helvetica", "", 9)
-            for _, row in items.iterrows():
-                pdf.cell(35, 7, str(row['品號']), border=1, align="C")
-                pdf.cell(85, 7, str(row['品名'])[:40], border=1, align="L")
-                pdf.cell(20, 7, str(row['數量']), border=1, align="C")
-                pdf.cell(25, 7, str(row['單價']), border=1, align="C")
-                pdf.cell(25, 7, str(row['金額']), border=1, align="C", new_x="LMARGIN", new_y="NEXT")
-                
-            pdf.ln(10)
-            
-            # 物流與重量資訊（帶入剛剛上方填寫的值）
-            pdf.set_font("helvetica", "B", 10)
-            pdf.cell(0, 6, f"Tracking No: {tracking_no}", new_x="LMARGIN", new_y="NEXT")
-            pdf.cell(0, 6, f"Gross Weight: {gross_weight}", new_x="LMARGIN", new_y="NEXT")
-            pdf.cell(0, 6, f"Dimensions: {dimensions}", new_x="LMARGIN", new_y="NEXT")
-            
-            # 輸出暫存檔案
-            output_filename = "Invoice_PackingList.pdf"
-            pdf.output(output_filename)
-            
-            # 提供下載按鈕
-            with open(output_filename, "rb") as f:
-                st.download_button(
-                    label="📥 下載產出的 Invoice & Packing List PDF",
-                    data=f,
-                    file_name="Invoice_PackingList.pdf",
-                    mime="application/pdf"
-                )
-            st.success("🎉 PDF 檔案已成功生成！")
-                
-        except Exception as e:
-            st.error(f"讀取 Excel 發生錯誤：{e}")
+        st.success(f"✅ 成功讀取銷貨單！共 {len(items_data)} 筆品項。")
+        
+    except Exception as e:
+        st.error(f"❌ 讀取 Excel 發生錯誤：{e}")
 else:
-    st.info("💡 請先上傳 Excel 檔案，才能點擊生成 PDF 按鈕喔！")
+    # 預設範例資料（方便未上傳時預覽）
+    header_data = {
+        '銷貨單號': '20260722002',
+        '客戶全名': '天津元象國際貿易有限公司',
+        '送貨地址(一)': '中國天津市濱海新區新北路4668號濱海創新創業園4棟'
+    }
+    items_data = [
+        {"品號": "D13750", "品名與規格": "美國壓縮彈簧 D13750", "數量": 50, "單價": 60.5, "金額": 3025},
+        {"品號": "SB20210540", "品名與規格": "Belle Disc Springs For Spindle 二代碟簧", "數量": 100, "單價": 7.2, "金額": 720}
+    ]
+
+# 3. 組合 HTML 表格內容
+table_rows_html = ""
+grand_total = 0
+for idx, item in enumerate(items_data):
+    subtotal = item['數量'] * item['單價']
+    grand_total += subtotal
+    table_rows_html += f"""
+    <tr>
+        <td style="padding: 8px; border: 1px solid #cbd5e1; text-align: center;">{idx+1}</td>
+        <td style="padding: 8px; border: 1px solid #cbd5e1;"><strong>{item['品號']}</strong><br>{item['品名與規格']}</td>
+        <td style="padding: 8px; border: 1px solid #cbd5e1; text-align: right;">{item['數量']:,}</td>
+        <td style="padding: 8px; border: 1px solid #cbd5e1; text-align: right;">{item['單價']:,.2f}</td>
+        <td style="padding: 8px; border: 1px solid #cbd5e1; text-align: right;">{item['金額']:,.2f}</td>
+    </tr>
+    """
+
+# 4. 建立如同你之前採購單一樣精美的 HTML 預覽版面
+html_code = f"""
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+    body {{
+        background: #f8fafc;
+        color: #333;
+        font-family: Arial, sans-serif;
+        margin: 0;
+        padding: 10px;
+    }}
+    .container {{
+        max-width: 750px;
+        margin: auto;
+        border: 1px solid #cbd5e1;
+        border-radius: 8px;
+        padding: 30px;
+        background: white;
+        box-shadow: 0 4px 6px rgba(0,0,0,0.05);
+    }}
+    .print-btn {{
+        background-color: #1a365d;
+        color: white;
+        border: none;
+        padding: 12px 24px;
+        font-size: 14pt;
+        font-weight: bold;
+        border-radius: 6px;
+        cursor: pointer;
+        display: block;
+        margin: 0 auto 25px auto;
+        text-align: center;
+        box-shadow: 0 2px 4px rgba(0,0,0,0.2);
+    }}
+    .print-btn:hover {{ background-color: #2a4365; }}
+    h2 {{ color: #1a365d; margin-bottom: 0px; text-align: center; }}
+    .subtitle {{ color: #666; margin-top: 5px; font-size: 11pt; text-align: center; }}
+    hr {{ border: 1px solid #1a365d; margin: 15px 0; }}
+    .grid {{ width: 100%; margin-top: 10px; border-collapse: collapse; }}
+    .box {{ background: #f8fafc; padding: 12px; border-radius: 5px; border: 1px solid #e2e8f0; font-size: 10pt; line-height: 1.5; }}
+    table.items {{ width: 100%; border-collapse: collapse; margin-top: 15px; }}
+    table.items th, table.items td {{ border: 1px solid #cbd5e1; padding: 8px; font-size: 10pt; }}
+    table.items th {{ background-color: #1a365d; color: white; text-align: center; }}
+    .text-right {{ text-align: right; }}
+
+    @media print {{
+        body {{ background: white; padding: 0; }}
+        .container {{ border: none; box-shadow: none; padding: 0; max-width: 100%; }}
+        .print-btn {{ display: none; }}
+    }}
+</style>
+</head>
+<body>
+    <div class="container">
+        <button class="print-btn" onclick="window.print()">🖨️ 點此列印 / 另存為 PDF 檔</button>
+
+        <h2>INVOICE & PACKING LIST</h2>
+        <div class="subtitle">商業發票與裝箱單</div>
+        <hr>
+        
+        <table class="grid">
+            <tr>
+                <td class="box" style="width: 50%; vertical-align: top;">
+                    <strong>【客戶資訊 (Ship to)】</strong><br>
+                    {header_data.get('客戶全名', '')}<br>
+                    地址：{header_data.get('送貨地址(一)', '')}
+                </td>
+                <td class="box" style="width: 50%; vertical-align: top;">
+                    <strong>【出貨資訊】</strong><br>
+                    Invoice No: {header_data.get('銷貨單號', '')}<br>
+                    Date: {doc_date}<br>
+                    Tracking No: {tracking_no}<br>
+                    Gross Weight: {gross_weight}<br>
+                    Dimensions: {dimensions}
+                </td>
+            </tr>
+        </table>
+
+        <table class="items">
+            <thead>
+                <tr>
+                    <th style="width: 10%;">項次</th>
+                    <th style="width: 45%;">品名與規格</th>
+                    <th class="text-right" style="width: 15%;">數量</th>
+                    <th class="text-right" style="width: 15%;">單價</th>
+                    <th class="text-right" style="width: 15%;">金額</th>
+                </tr>
+            </thead>
+            <tbody>
+                {table_rows_html}
+            </tbody>
+        </table>
+
+        <div style="text-align: right; font-size: 12pt; font-weight: bold; margin-top: 15px;">
+            Total Amount: {grand_total:,.2f}
+        </div>
+    </div>
+</body>
+</html>
+"""
+
+st.markdown("---")
+st.subheader("📋 3. 正式單據預覽與一鍵列印")
+components.html(html_code, height=950, scrolling=True)
